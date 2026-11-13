@@ -132,16 +132,25 @@ fi
 # 稼働中のコンテナイメージをスキャン（Docker が動いている VM のみ）
 if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
   i=0
-  while read -r image; do
+  while IFS=$'\t' read -r image cname; do
     [[ -z $image ]] && continue
     i=$((i + 1))
     out=$RUN_DIR/image-$i.json
+
+    # タグが外れて ID だけになったイメージは、コンテナ名を添えて見分けられるようにする
+    label=$image
+    if [[ $image =~ ^(sha256:)?[0-9a-f]{12,}$ ]]; then
+      label="${image#sha256:}"
+      label="${label:0:12}（$cname）"
+    fi
+
     if trivy image "${common[@]}" --skip-db-update --output "$out" "$image"; then
+      jq --arg l "$label" '. + {Label: $l}' "$out" >"$out.tmp" && mv "$out.tmp" "$out"
       results+=("$out")
     else
-      errors+=("$image")
+      errors+=("$label")
     fi
-  done < <(docker ps --format '{{.Image}}' | sort -u)
+  done < <(docker ps --format '{{.Image}}\t{{.Names}}' | sort -u -t $'\t' -k1,1)
 fi
 
 # Discord 用の要約を作成
@@ -167,16 +176,26 @@ if ((${#results[@]} > 0)); then
     # 全脆弱性を「対象・場所」付きで平らにし、重複を除く
     . as $in
     | [ $in[]
-      | (if .ArtifactType == "container_image" then .ArtifactName else "ホスト" end) as $t
+      | (if .ArtifactType == "container_image" then (.Label // .ArtifactName) else "ホスト" end) as $t
       | .Results[]? | .Class as $cl | .Target as $tg
       | .Vulnerabilities[]?
       | {target: $t, loc: loc($cl; $tg), id: .VulnerabilityID, pkg: .PkgName, ver: .InstalledVersion, Severity}
     ] | unique_by([.target, .loc, .id, .pkg, .ver]) as $all
 
-    # 対象ごとの件数（スキャンした対象は 0 件でも表示）
-    | ([ $in[] | if .ArtifactType == "container_image" then .ArtifactName else "ホスト" end ] | unique
-        | map(select(. == "ホスト")) + map(select(. != "ホスト"))) as $names
-    | ($names | map(. as $n | "・`\($n)`: " + count([$all[] | select(.target == $n)])) | join("\n")) as $counts
+    # 対象ごとの件数（ホストは常に先頭。イメージは件数の多い 10 件まで、残りと 0 件はまとめる）
+    | ([ $in[] | select(.ArtifactType == "container_image") | (.Label // .ArtifactName) ] | unique
+        | map(. as $n | [$all[] | select(.target == $n)] as $v
+              | {n: $n, c: ([$v[] | select(.Severity == "CRITICAL")] | length), h: ([$v[] | select(.Severity == "HIGH")] | length)})
+      ) as $imgs
+    | ([$imgs[] | select(.c + .h > 0)] | sort_by([-.c, -.h, .n])) as $bad
+    | ([$imgs[] | select(.c + .h == 0)] | length) as $clean
+    | ($bad[10:]) as $rest
+    | (["・`ホスト`: " + count([$all[] | select(.target == "ホスト")])]
+       + ($bad[:10] | map("・`\(.n)`: CRITICAL \(.c) / HIGH \(.h)"))
+       + (if ($rest | length) > 0
+          then ["（ほか \($rest | length) イメージ: CRITICAL \([$rest[].c] | add) / HIGH \([$rest[].h] | add)）"] else [] end)
+       + (if $clean > 0 then ["（問題なし: \($clean) イメージ）"] else [] end)
+      | join("\n")) as $counts
 
     # ホストで件数が多い場所の上位 10
     | ([ $all[] | select(.target == "ホスト") ] | group_by(.loc)
