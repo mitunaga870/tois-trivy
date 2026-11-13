@@ -159,6 +159,7 @@ if ((${#results[@]} > 0)); then
             (if (($s[3] // "") | startswith(".")) then $s[0:4] else $s[0:5] end | join("/"))
           elif $s[1] == "root" then
             (if (($s[2] // "") | startswith(".")) then $s[0:3] else $s[0:4] end | join("/"))
+          elif $d == "" then "場所不明（\($target)）"
           else $d end
       end;
     def count($v): "CRITICAL \([$v[] | select(.Severity == "CRITICAL")] | length) / HIGH \([$v[] | select(.Severity == "HIGH")] | length)";
