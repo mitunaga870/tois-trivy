@@ -147,27 +147,47 @@ fi
 # Discord 用の要約を作成
 if ((${#results[@]} > 0)); then
   msg=$(jq -rs --arg host "$HOST" --arg date "$(date '+%Y-%m-%d %H:%M')" '
-    def rank: if . == "CRITICAL" then 0 else 1 end;
-    [ .[] | {
-        name: (if .ArtifactName == "/" then "ホスト" else .ArtifactName end),
-        vulns: [ .Results[]?.Vulnerabilities[]? ]
-      } ] as $targets
-    | ($targets | map(
-        "・`\(.name)`: CRITICAL \([.vulns[] | select(.Severity == "CRITICAL")] | length)"
-        + " / HIGH \([.vulns[] | select(.Severity == "HIGH")] | length)"
-      ) | join("\n")) as $counts
-    | ([ $targets[] | .name as $n | .vulns[] | . + {target: $n} ]
-        | unique_by([.target, .VulnerabilityID, .PkgName])
-        | sort_by([(.Severity | rank), .VulnerabilityID])) as $all
-    | ($all[:10] | map(
-        "・[\(.Severity)] \(.VulnerabilityID) \(.PkgName) \(.InstalledVersion) → "
-        + ((.FixedVersion // "") as $f | if $f == "" then "修正版なし" else $f end)
-        + "（\(.target)）"
-      ) | join("\n")) as $top
-    | "**Trivyスキャン: \($host)**（\($date)）\n\($counts)\n\n"
-      + (if ($all | length) == 0
-         then "CRITICAL / HIGH の脆弱性はありません"
-         else "**上位\([($all | length), 10] | min)件**（全\($all | length)件）\n\($top)"
+    # 検出場所をプロジェクト単位にまとめる（OS パッケージは 1 つに集約）
+    def loc($class; $target):
+      if $class == "os-pkgs" then "OSパッケージ"
+      else
+        ("/" + ((.PkgPath // $target // "") | ltrimstr("/"))) as $p
+        | ([$p | splits("/(node_modules|site-packages|dist-packages|vendor|\\.?venv)/")][0]) as $c
+        | (if $c != $p then $c else ($p | sub("/[^/]*$"; "")) end) as $d
+        | ($d | split("/")) as $s
+        | if $s[1] == "home" then
+            (if (($s[3] // "") | startswith(".")) then $s[0:4] else $s[0:5] end | join("/"))
+          elif $s[1] == "root" then
+            (if (($s[2] // "") | startswith(".")) then $s[0:3] else $s[0:4] end | join("/"))
+          else $d end
+      end;
+    def count($v): "CRITICAL \([$v[] | select(.Severity == "CRITICAL")] | length) / HIGH \([$v[] | select(.Severity == "HIGH")] | length)";
+
+    # 全脆弱性を「対象・場所」付きで平らにし、重複を除く
+    . as $in
+    | [ $in[]
+      | (if .ArtifactType == "container_image" then .ArtifactName else "ホスト" end) as $t
+      | .Results[]? | .Class as $cl | .Target as $tg
+      | .Vulnerabilities[]?
+      | {target: $t, loc: loc($cl; $tg), id: .VulnerabilityID, pkg: .PkgName, ver: .InstalledVersion, Severity}
+    ] | unique_by([.target, .loc, .id, .pkg, .ver]) as $all
+
+    # 対象ごとの件数（スキャンした対象は 0 件でも表示）
+    | ([ $in[] | if .ArtifactType == "container_image" then .ArtifactName else "ホスト" end ] | unique
+        | map(select(. == "ホスト")) + map(select(. != "ホスト"))) as $names
+    | ($names | map(. as $n | "・`\($n)`: " + count([$all[] | select(.target == $n)])) | join("\n")) as $counts
+
+    # ホストで件数が多い場所の上位 10
+    | ([ $all[] | select(.target == "ホスト") ] | group_by(.loc)
+        | map({loc: .[0].loc, c: ([.[] | select(.Severity == "CRITICAL")] | length), h: ([.[] | select(.Severity == "HIGH")] | length)})
+        | sort_by([-.c, -.h])) as $locs
+    | ($locs[:10] | map("・`\(.loc)`: CRITICAL \(.c) / HIGH \(.h)") | join("\n")) as $top
+
+    | "**Trivyスキャン: \($host)**（\($date)）\n\($counts)"
+      + (if ($all | length) == 0 then "\n\nCRITICAL / HIGH の脆弱性はありません"
+         elif ($locs | length) == 0 then ""
+         else "\n\n**件数が多い場所（ホスト）**\n\($top)"
+              + (if ($locs | length) > 10 then "\n（ほか \(($locs | length) - 10) か所）" else "" end)
          end)
   ' "${results[@]}")
 else
