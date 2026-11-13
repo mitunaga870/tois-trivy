@@ -144,7 +144,10 @@ if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
       label="${label:0:12}（$cname）"
     fi
 
-    if trivy image "${common[@]}" --skip-db-update --output "$out" "$image"; then
+    # ローカルのイメージで失敗したら、レジストリから直接取得して再試行する
+    # （containerd イメージストアでは、レイヤーが手元に揃っておらず docker から読めないことがある）
+    if trivy image "${common[@]}" --skip-db-update --output "$out" "$image" ||
+      trivy image "${common[@]}" --skip-db-update --image-src remote --output "$out" "$image"; then
       jq --arg l "$label" '. + {Label: $l}' "$out" >"$out.tmp" && mv "$out.tmp" "$out"
       results+=("$out")
     else
